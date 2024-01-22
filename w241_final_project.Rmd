@@ -1,0 +1,632 @@
+---
+title: "w241_final_pilot_results"
+author: "Kineret"
+date: "3/16/2021"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(pwr)
+library(psych)
+library(dplyr)
+library(rstatix)
+library(ggplot2)
+library(tidyr)
+library(sf)
+library(stargazer)
+library(sandwich)
+library(mice)
+library(stringr)
+library("MatchIt")
+library("optmatch")
+library("ggplot2")
+library(ggthemes)
+library(tidyverse)
+library(MASS)
+```
+
+```{r robust standard error}
+robust_se <- function(mod, type = 'HC3') { 
+  sqrt(diag(vcovHC(mod, type)))
+  }
+```
+
+
+```{r import study responses}
+#pilot_d <- fread("Voter Sentiment Study - Trump_March 16, 2021_16.07 - Pilot.csv")
+study <- fread("Combined_Studies_Raw.csv")
+#first row has items - remove
+study = study[-1,]
+
+# drop unused columns
+study[, (c("RecipientLastName", "RecipientFirstName",
+      "RecipientEmail","UserLanguage","DistributionChannel")) := NULL]
+
+ 
+```
+
+```{r import participant profiles}
+biden_profiles <-fread("Prolific Export for Biden.csv")
+trump_profiles <-fread("Prolific Export for Trump.csv")
+
+# add column with study name 
+biden_profiles$study <- 'Biden'
+trump_profiles$study <- 'Trump'
+
+# append the two profile tables and then join into response table
+participant_profiles <- rbind(biden_profiles, trump_profiles)
+
+# set key for joins
+#setkey(biden_profiles, participant_id)
+#setkey(trump_profiles, participant_id)
+
+# merge
+d <- merge(study, participant_profiles, by.x = "ID", 
+           by.y = "participant_id", all.x = TRUE)
+```
+
+## Create a treatment flag and then merge the survey item responses
+```{r is_treatment}
+# check that both biden_approve columns are not blank
+any(d[,is.na(biden_approve_f_1) & is.na(biden_approve_nf_1)])
+# then mark record as in treatment if biden_approve_f_1 is not na
+# if it ends in nf not treated. if it ends in _f then treated
+d[,treat:= ifelse(is.na(biden_approve_f_1)==TRUE |
+                  biden_approve_f_1 == "" ,0,1)]
+
+d[, treat_coltitle:= ifelse(treat == 1, "Treatment", "Control")]
+d[, biden_voter := ifelse(vote2020 =="Yes, for Biden",1,0)]
+
+```
+
+```{r clean up data}
+columns_to_collapse <- list("biden_approve", 
+                         "trump_approve",
+                         "avg",
+                         "optimism",
+                         "unite",
+                         "covid",
+                         "attention",
+                         "your_yard",
+                         "neighbor_yard")
+                         
+merge_cols <- function(cn) {
+  # return column indices
+  cn <- eval(cn)
+  x <- d[, grep(cn, names(d))]
+  x_1 <- as.numeric(x[1])
+  x_2 <- as.numeric(x[2])
+  # create a new column
+  d[, substitute(cn) := do.call(paste, .SD), .SDcols = c(x_1,x_2)]
+  # delete the old ones
+  d[, (c(x_1,x_2)) := NULL]
+  return(d)
+
+}
+```
+
+
+
+```{r lapply issue, echo=FALSE, results = FALSE}
+# question posted in stackoverflow
+lapply(columns_to_collapse, merge_cols)
+```
+
+```{r Attention Checks, results = FALSE}
+d[, sum(is.na(.SD)),  .SDcols = c("attention")]
+na.omit(d, cols = c("attention"))
+d$attention <- str_replace_all(d$attention, fixed(" "), "")
+d<-d[d$attention=='2021']
+```
+
+```{r response duration check}
+d$`Duration (in seconds)` <-as.numeric(d$`Duration (in seconds)`)
+duration_sd<-sd( na.omit(d$`Duration (in seconds)`))
+duration_mean<-mean( na.omit(d$`Duration (in seconds)`))
+upper_threshold<-duration_mean+3*duration_sd
+lower_threshold<-duration_mean-3*duration_sd
+d<-d[d$`Duration (in seconds)`<upper_threshold]
+d<-d[d$`Duration (in seconds)`> lower_threshold]
+```
+
+
+# Attrition & Imputation
+
+
+```{r impute dataset}
+# fixing column names to be referenced properly (can't have spaces or commas)
+names(d)<-str_replace_all(names(d), c(" " = "_" , "," = "", "[(]" = "", "[)]" = ""))
+# fixing colnames that start with a number
+colnames(d)[which(names(d) == "2020_US_presidential_election")] <- "US_2020_presidential_election"
+
+# in these records we see that some doesn't actually have valid prolific id, thus need to be removed
+# this is because we cannot verify they have passed our prescreening
+invalid_ids <- d[nchar(d$ID)!=nchar("55f5e5e132af740012171c62")]$ID
+
+# We see that these usually result in the missing values of all cross validated fields in prolific
+# thus we can omit other rows that failed the cross validation
+# We choose one arbitrary of the fields that's from prolific to omit the rows
+d <- na.omit(d, cols="time_taken")
+
+
+# now, we check the proper attrition of the dataset 
+# this showss the distribution of missing values are incomplete
+md.pattern(d)
+# we see that we have 478 complete records, 3 records missing the value of age
+
+
+# let's fill those in
+# first set up the tables
+init <- mice(d, maxit=0)
+meth <- init$method
+predM <- init$predictorMatrix
+
+# we know we need to impute on age
+# using predictive mean matching
+meth[c("age")] <- "pmm"
+
+# setting the seed
+set.seed(4444)
+
+# now use mulitple imputation
+imputed_dt <- mice(d, method=meth, predictorMatrix=predM, m=5)
+
+imputed_dt <- complete(imputed_dt)
+
+d <- imputed_dt
+
+# now check again
+# should have complete dataset
+md.pattern(d)
+
+```
+
+```{r covariate balance check}
+# covariate balance check for all data
+#m_out <- matchit(data=d, treat~age + Sex + Student_Status + Employment_Status + U.S._Political_Affiliation, method="full")
+#balance_summary <- summary(m_out)
+#plot(balance_summary)
+
+# covariate balance check for interaction group of biden voters
+#m_out_biden <- matchit(data=d[d$study=="biden"], treat~age + Sex + Student_Status + Employment_Status + U.S._Political_Affiliation, method="full")
+#balance_summary_biden <- summary(m_out_biden)
+#plot(balance_summary_biden)
+
+
+```
+
+```{r Additional Data Clean}
+d <- as.data.table(d)
+columns_to_trim <- c("biden_approve", "trump_approve", "avg", "optimism", "unite", "covid",
+               "attention", "your_yard", "neighbor_yard")
+# trim spaces
+d[,  (columns_to_trim) := lapply(.SD, str_trim), .SDcols = columns_to_trim]
+
+```
+
+
+```{r}
+table(d$treat)
+```
+
+# EDA
+```{r}
+source("http://pcwww.liv.ac.uk/~william/R/crosstab.r")
+```
+
+## Gender
+```{r Gender}
+
+ggplot(aes(x=study, fill=Sex), data = d) + 
+  geom_bar(position = "dodge")+ 
+  facet_wrap(treat_coltitle~., ncol = 1) +
+  ggtitle("Participant Gender - Proportional \n Across Treatment / Control & Blocks") +
+  xlab("2020 US Presidential Vote") +
+  labs(fill = "Gender") +
+  theme_gdocs() +
+  scale_fill_pander() 
+
+```
+
+## Employment Status
+
+```{r Employment Statust}
+
+(d %>%
+   transform(temp_treatment = ifelse(treat == 1, "Treatment", "Control")) %>%
+   filter(Employment_Status != "DATA EXPIRED") %>%
+   drop_na(Employment_Status) %>%
+   filter(Employment_Status != "") %>%
+   mutate(Employment_Status = ifelse(Employment_Status == "Not in paid work (e.g. homemaker', 'retired or disabled)","Unpaid Work (e.g., homemaker)",Employment_Status)) %>%
+    mutate(Employment_Status = ifelse(Employment_Status == "Due to start a new job within the next month","Other",Employment_Status)) %>%
+    
+   ggplot(aes(x=study, fill=Employment_Status)) + 
+   geom_bar() + 
+   facet_wrap(temp_treatment~., ncol = 1) + 
+   ggtitle("<50% Full Time Employed") + 
+   xlab("2020 US Presidential Vote") +
+   labs(fill = "Employment") +
+   theme_gdocs() +
+   scale_fill_pander()
+)
+```
+## Age
+```{r Age}
+
+(d %>%
+   transform(temp_treatment = ifelse(treat == 1, "Treatment", "Control")) %>%
+   drop_na(age) %>%
+  
+   ggplot(aes(x = treat_coltitle, y = age)) +
+   geom_boxplot(aes(fill = study)) +
+   facet_wrap(~treat_coltitle, scale="free") + 
+   theme_gdocs() + 
+   scale_fill_gdocs() + 
+   theme(legend.title = element_blank(), 
+              axis.title.x = element_blank(),
+              axis.title.y = element_blank()) + 
+   ggtitle("Participant Age Breakdown")
+)
+
+# average age of voter by study
+d[,mean(age, na.rm = TRUE), keyby = .(study)]
+
+```
+## Student Status
+```{r Student Statust}
+
+(d  %>%
+   # clean up this features
+    mutate(Student_Status = ifelse(Student_Status == "DATA EXPIRED", "Unknown", 
+                                   ifelse(Student_Status == "", "Unknown", Student_Status))) %>%
+   
+  ggplot(aes(y = Student_Status, x = treat_coltitle,
+              fill = Student_Status)) +
+  geom_bar(position = "stack", stat = "identity") + 
+  facet_wrap(study~.) +
+  theme_gdocs() +
+  theme(legend.title = element_blank(), 
+              legend.position="top",
+              axis.title.x = element_blank(),
+              axis.title.y = element_blank(),
+              axis.text.y=element_blank(),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank()) +
+  scale_fill_economist() +
+  ggtitle("Student Status")
+)
+```
+
+```{r}
+# pct student status by study
+a <- table(d$Student_Status, d$study)
+a
+```
+
+## Map
+>https://cran.r-project.org/web/packages/ggmap/readme/README.html
+
+```{r map}
+d$lat <- as.numeric(d$LocationLatitude)
+d$long <- as.numeric(d$LocationLongitude)
+
+# I used Google Maps and had to call an API (there may be an associated cost). Comment out unless you want to go through this set up
+library("ggmap")
+# register_google(key = "")
+#(get_googlemap(c(95.7129, 37.0902), color = "bw", zoom = 5) %>%
+#    ggmap()
+#)
+
+#Create a custom color scale
+library(RColorBrewer)
+myColors <- c("#3366CC", "#DC3912")
+names(myColors) <- levels(d$study)
+colScale <- scale_colour_manual(name = "2020 Presidential Election Block",values = myColors)
+
+qmplot(long, lat, data = d, color=study, size=I(3), alpha=I(.3), zoom = 5) +colScale
++ theme_gdocs()
+
+```
+
+## Response Visualizations
+
+
+```{r Items 1 to 6 fig.width=6, fig.height=10, echo=FALSE}
+(
+  d %>% 
+  # select(treat_coltitle, biden_approve, trump_approve, treat_coltitle, avg, optimism, unite, covid) %>% 
+   pivot_longer(cols = c("biden_approve", "trump_approve",
+                            "avg", "optimism", "unite", "covid" ),
+                names_to = "key", values_to = "values") %>%
+  #necessary to keep order of items
+  mutate(group = factor(key, levels = c("biden_approve", "trump_approve",
+                            "avg", "optimism", "unite", "covid")))%>%
+  mutate(values = as.integer(values)) %>%         
+
+  # Plot all but neighbor items
+  ggplot(aes(x = treat_coltitle, y = (values), color = treat_coltitle)) +
+  geom_boxplot() +
+  facet_wrap(group~., scale="fixed") + 
+  theme_gdocs() +
+  theme(legend.title = element_blank(), 
+              legend.position="top",
+              axis.title.x = element_blank(),
+              axis.title.y = element_blank(),
+              axis.text.x=element_blank(),
+              axis.ticks.x=element_blank(),
+        # Remove panel grid lines
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank())+
+  scale_colour_colorblind() + 
+  ggtitle("Outcomes Items 1-6")
+)
+```
+
+```{r Items 7 fig.width=6, fig.height=10, echo=FALSE}
+(
+  d %>% 
+  # select(treat_coltitle, your_yard ) %>% 
+   pivot_longer(cols = c("your_yard" ),
+                names_to = "key", values_to = "values") %>%
+  #necessary to keep order of items
+  mutate(group = factor(key, levels = c("your_yard")))%>%
+  mutate(values = as.integer(values)) %>%         
+
+  # Plot all but neighbor items
+  ggplot(aes(x = treat_coltitle, y = (values),
+                         color = treat_coltitle)) +
+  geom_boxplot() +
+  #facet_wrap(group~., scale="fixed") + 
+  theme_gdocs() +
+  theme(legend.title = element_blank(), 
+              legend.position="top",
+              axis.title.x = element_blank(),
+              axis.title.y = element_blank(),
+              axis.text.x=element_blank(),
+              axis.ticks.x=element_blank(),
+        # Remove panel grid lines
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank()
+  )+
+  scale_colour_colorblind() + 
+  ggtitle("Your Yard")
+)
+```
+
+
+```{r Items 8 fig.width=6, fig.height=10, echo=FALSE}
+d <- data.table(d)
+d[, neighbor_yard_cat := ifelse(neighbor_yard == "1", "Support Dem",
+                                ifelse(neighbor_yard == "2", "Support Repub",
+                                ifelse(neighbor_yard == "3", "Equally Likely",neighbor_yard)))]
+
+ggplot(d, aes(y = neighbor_yard_cat, x = treat_coltitle, fill = neighbor_yard_cat)) +
+  geom_bar(position = "stack", stat = "identity") + 
+  facet_wrap(study~.) +
+  theme_gdocs() +
+  theme(legend.title = element_blank(), 
+              legend.position="top",
+              axis.title.x = element_blank(),
+              axis.title.y = element_blank(),
+              axis.text.y=element_blank(),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank()) +
+  scale_fill_economist() +
+  ggtitle("Neighbors Yard")
+```
+# Models
+
+Voting history is significant in whether you approve of Trump (makes complete sense). However, there's not a statistically meaningful difference in outcomes for treatment vs control groups.
+
+```{r Model Set Up}
+
+d <- (d %>% mutate(Sex = na_if(Sex, "Prefer not to say")))
+d<- (d %>% mutate(Student_Status = na_if(Student_Status, "")))
+
+
+d_long <- (d %>% dplyr::select(trump_approve, biden_approve,avg, optimism, unite, covid, your_yard,
+              neighbor_yard, treat, study, U.S._Political_Affiliation, Sex, Student_Status, age) %>% 
+      pivot_longer(cols = -c(study, treat, U.S._Political_Affiliation, Sex, Student_Status, age))
+        )
+
+d_long$value <- as.numeric(d_long$value)
+list_outcomes <- split(d_long, forcats::fct_inorder(factor(d_long$name)), lex.order = FALSE)
+```
+
+
+## Model 1
+
+Voting history is significant in whether you approve of Trump (makes complete sense). However, there's not a statistically meaningful difference in outcomes for treatment vs control groups.
+
+```{r Model 1, warning = False}
+
+
+lm_model_1_list <- lapply(list_outcomes, function(x) lm(value ~ treat, x))
+se_robust_error_list_1 <- lapply(lm_model_1_list, function(x) robust_se(x))
+
+stargazer(lm_model_1_list, 
+          type = "text",
+          title = "Model 1",
+          column.labels = c('trump approve', 'biden approve',
+                 'avg', 'optimism', 'unite', 'covid', 'your yard', 'neighbor yard'),
+          model.numbers=FALSE,#         
+          se = se_robust_error_list_1,
+          omit.stat = c('ser', 'F'),
+          notes = "Robust Standard Errors")
+```
+
+### Ordinal Logit Model
+```{r Ordinal Logit Models -  Item 8, warning = FALSE}
+
+#check to see if the ordinal logit model returns similar findings as OLS. It's ok to use OLS if it does and call out that we checked the ordinal logit model first. 
+#https://www.princeton.edu/~otorres/LogitR101.pdf slide 15
+
+logit_1 <- d[, polr(as.factor(neighbor_yard) ~ treat, Hess = TRUE)]
+logit_2 <- d[, polr(as.factor(neighbor_yard) ~ treat + study, Hess = TRUE)]
+logit_3 <- d[, polr(as.factor(neighbor_yard) ~ treat + study + (treat * study), Hess = TRUE)]
+logit_4 <- d[, polr(as.factor(neighbor_yard) ~ treat + study + (treat * study) +U.S._Political_Affiliation 
+                    + age + Sex + Student_Status, Hess = TRUE)]
+
+
+stargazer(logit_1, logit_2, logit_3, logit_4, 
+          type = "text",
+          title = "Ordinal Logit Model",
+          model.numbers=TRUE,    
+         # se =  list(logit_1, logit_2, logit_3, logit_4),
+          omit = c('U.S._Political_Affiliation','Student_Status', 'Sex', 'age'),
+          notes = c("US Political Affiliation, Gender, Age, and Student Status suppressed")
+)
+
+```
+
+
+## Model 2: With 2020 Pres Voting Record Covariate
+
+```{r presidential election cov, warning = FALSE}
+
+lm_model_list_2 <- lapply(list_outcomes, function(x) lm(value ~ treat + study, x))
+se_robust_error_list_2 <- lapply(lm_model_list_2, function(x) robust_se(x))
+
+stargazer(lm_model_list_2, 
+          type = "text",
+          title = "Model 2",
+          column.labels = c('trump approve', 'biden approve',
+                 'avg', 'optimism', 'unite', 'covid', 'your yard', 'neighbor_yard'),
+          model.numbers=FALSE,#         
+          se = se_robust_error_list_2,
+          omit.stat = c('ser', 'F'),
+          note = "all with Robust Standard Errors")
+
+```
+
+
+## Model 3: Plus interaction
+
+```{r presidential election cov with interaction effect, warning = FALSE}
+
+
+lm_model_list_3 <- lapply(list_outcomes, function(x) lm(value ~ treat + study + as.factor(study) * treat, x))
+se_robust_error_list_3 <- lapply(lm_model_list_3, function(x) robust_se(x))
+
+stargazer(lm_model_list_3, 
+          type = "text",
+          title = "Model 3",
+          column.labels = c('trump approve', 'biden approve',
+                 'avg', 'optimism', 'unite', 'covid', 'your yard', 'neighbor_yard'),
+          model.numbers=FALSE,#         
+          se = se_robust_error_list_3,
+          omit.stat = c('ser', 'F'),
+          note = "all with Robust Standard Errors")
+
+```
+
+
+## Final Model: All covariates identified in measurement plan
+
++  #don't need to explicitly add each factor. R will do that if you add the interaction
+                                                           
+```{r final model, warning = FALSE}
+
+
+lm_model_list_final <- lapply(list_outcomes, function(x) lm(value ~ treat + as.factor(study) + (as.factor(study) * treat) + 
+                                                               #don't need to explicitly add each factor. R will do that if you add the interaction
+                                                              age * as.factor(study) +  Sex * as.factor(study) +
+                                                              Student_Status * as.factor(study) + 
+                                                              U.S._Political_Affiliation * as.factor(study)
+                                                              , x))
+se_robust_error_list_final <- lapply(lm_model_list_final, function(x) robust_se(x))
+
+stargazer(lm_model_list_final, 
+          type = "text",
+          title = "Final Model",
+          column.labels = c('trump approve', 'biden approve',
+                 'avg', 'optimism', 'unite', 'covid', 'your yard',
+                'neighbor yard'),
+          model.numbers=FALSE,#         
+          se = se_robust_error_list_final,
+          omit.stat = c('ser', 'F'),
+        #  omit = c('U.S._Political_Affiliation','Student_Status', 'Sex', 'age'),
+          notes = c("All with Robust Standard Errors") #,"US Political Affiliation, Gender, Age, and Student Status suppressed"
+)
+
+```
+
+## Difference Btwn Trump and Biden in Treatment vs Control
+## NOT COMPLETED. 
+We want to understand whether treatment narrows the gap between the two blocks. 
+
+```{r difference in differences, warning = FALSE}
+# NOPE - NOT the way to go..
+did_biden <- d[, lm(biden_approve ~ treat * study + Sex + Student_Status + age)]
+# the coefficient for treat:studyTrump 
+# https://www.princeton.edu/~otorres/DID101R.pdf
+# Coefficients with Robust Standard Errors
+robust_coef<- function(model){coeftest(model, vcovHC(model))}
+did_biden_coeff <- robust_coef(did_biden)[4]
+
+d[, did_biden_coeff := did_biden_coeff]
+```
+
+```{r did model}
+did_final_1 <- d[,lm(biden_approve ~ treat + study + did_biden_coeff)]
+summary(did_final_1)
+```
+
+## Model Comparison for Biden
+```{r model comparison}
+
+#This is fine for a check, but by excluding Trump voters this is regression on the biden block only. 
+
+# models with just trump approval
+# we can do this becaues the covariate balance is checked
+model_1 <- lm(data=d[d$study=="biden"], trump_approve~treat)
+model_2 <- lm(data=d[d$study=="biden"], trump_approve~treat+Employment_Status)
+model_3 <- lm(data=d[d$study=="biden"], trump_approve~treat+Employment_Status+Sex)
+model_4 <- lm(data=d[d$study=="biden"], trump_approve~treat+Employment_Status+Sex+age)
+model_5 <- lm(data=d[d$study=="biden"], trump_approve~treat+Employment_Status+Sex+age+U.S._Political_Affiliation)
+
+anova(model_1, model_2, model_3, model_4, model_5)
+
+stargazer(
+  model_1,
+  model_2,
+  model_3,
+  model_4,
+  model_5,
+  type='text',
+  se=list(
+    robust_se(model_1),
+    robust_se(model_2),
+    robust_se(model_3),
+    robust_se(model_4),
+    robust_se(model_5)
+  ))
+
+stargazer(
+  model_1,
+  model_2,
+  model_3,
+  model_4,
+  model_5,
+  type='html',
+  out='model_comparison.html',
+  se=list(
+    robust_se(model_1),
+    robust_se(model_2),
+    robust_se(model_3),
+    robust_se(model_4),
+    robust_se(model_5)
+  ))
+
+
+
+
+```
+
+
